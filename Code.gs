@@ -223,11 +223,15 @@ function backfill(fromYyyyMmDd, toYyyyMmDd) {
  * Catch-up runs. Run clearProcessedLabels FIRST if the months you want were
  * already marked done by an earlier run, otherwise they stay excluded.
  */
+/** How far back the catch-up reaches. Two formats, same day. */
+var REPUSH_FROM_SEARCH = '2026/07/20';
+var REPUSH_FROM_ISO    = '2026-07-20';
+
 /**
  * Re-examines everything the subject-scoping fix unblocked (Hafele invoices
  * and anything else excluded because an attached PDF contained a negative
- * keyword). Starts at the Hubdoc go-live date - invoices received before
- * that are never forwarded anyway, by design.
+ * keyword), and forwards what it finds even though some of it predates the
+ * normal Hubdoc cut-off.
  *
  * RUN protectManuallyForwarded() FIRST, or invoices you already forwarded
  * by hand will be forwarded a second time and show up twice in Xero.
@@ -237,7 +241,14 @@ function repushMissedInvoices() {
     Logger.log('STOP: run protectManuallyForwarded() first, then run this again.');
     return;
   }
-  processRange('2026/08/11', tomorrow());
+  // Lower the Hubdoc cut-off for the duration of the catch-up, so invoices
+  // received between 20 July and the 11 August go-live are forwarded too.
+  // Cleared automatically by the run that finishes the backlog.
+  PropertiesService.getScriptProperties()
+    .setProperty('HUBDOC_START_OVERRIDE', REPUSH_FROM_ISO);
+  Logger.log('Catch-up: forwarding invoices received on or after ' +
+             REPUSH_FROM_ISO + '. This may take several runs.');
+  processRange(REPUSH_FROM_SEARCH, tomorrow());
 }
 
 /**
@@ -251,12 +262,19 @@ function protectManuallyForwarded() {
 
   MAILBOXES.forEach(function (user) {
     var ids = gmailSearch(user, 'in:sent to:' + to + ' after:2026/07/01');
-    forwards += ids.length;
-    Logger.log(user + ': ' + ids.length + ' manual forward(s) to Hubdoc');
+    Logger.log(user + ': ' + ids.length + ' message(s) sent to Hubdoc');
 
     ids.forEach(function (id) {
       try {
-        var sent = gmailApi(user, 'GET', 'messages/' + id + '?format=minimal');
+        var sent = gmailApi(user, 'GET', 'messages/' + id +
+                            '?format=metadata&metadataHeaders=Subject');
+        // The router's own forwards are already in the ledger and start a
+        // thread of their own - nothing to protect. Only hand-forwards sit
+        // in a thread alongside the supplier's original message.
+        var subj = (headerMap(sent).subject || '');
+        if (subj.indexOf('Invoice:') === 0) return;
+        forwards++;
+
         var thread = gmailApi(user, 'GET', 'threads/' + sent.threadId + '?format=full');
         (thread.messages || []).forEach(function (m) {
           var h = headerMap(m);
@@ -280,8 +298,8 @@ function protectManuallyForwarded() {
 
   PropertiesService.getScriptProperties()
     .setProperty('HUBDOC_PROTECTED', String(Date.now()));
-  Logger.log(forwards + ' manual forward(s) examined, ' + sealed +
-             ' document(s) marked as already sent.');
+  Logger.log(forwards + ' hand-forward(s) examined, ' + sealed +
+             ' document(s) marked as already sent (they will not be re-sent).');
   Logger.log('Now run repushMissedInvoices().');
 }
 
@@ -475,6 +493,9 @@ function processRangeInner(after, before, opts) {
       ? 'Hit the ' + MAX_CLASSIFICATIONS_PER_RUN + ' classification cap.'
       : 'Ran out of time before finishing.');
     if (!opts.dryRun) scheduleFollowUp(after, before);
+  } else if (!opts.dryRun) {
+    // Nothing left outstanding, so any temporary catch-up cut-off is spent.
+    clearHubdocOverride();
   }
 
   if (!opts.dryRun) queueDigest(stats, report);
@@ -1836,10 +1857,32 @@ function hubdocLedger() {
 }
 
 /** Emails received before HUBDOC_START_DATE were handled by hand already. */
+/**
+ * The cut-off in force right now. A catch-up run can lower it temporarily by
+ * setting HUBDOC_START_OVERRIDE; it lives in Script Properties rather than a
+ * variable because a capped run resumes in a SEPARATE execution, which would
+ * otherwise silently revert to the normal date half way through the backlog.
+ */
+function hubdocStartDate() {
+  return PropertiesService.getScriptProperties()
+           .getProperty('HUBDOC_START_OVERRIDE') || HUBDOC_START_DATE;
+}
+
 function newEnoughForHubdoc(received) {
-  if (!HUBDOC_START_DATE) return true;
+  var start = hubdocStartDate();
+  if (!start) return true;
   var stamp = Utilities.formatDate(received, 'Australia/Sydney', 'yyyy-MM-dd');
-  return stamp >= HUBDOC_START_DATE;
+  return stamp >= start;
+}
+
+/** Back to the normal cut-off. Runs automatically when a catch-up finishes. */
+function clearHubdocOverride() {
+  var o = PropertiesService.getScriptProperties()
+            .getProperty('HUBDOC_START_OVERRIDE');
+  if (!o) return;
+  PropertiesService.getScriptProperties().deleteProperty('HUBDOC_START_OVERRIDE');
+  Logger.log('Catch-up finished - Hubdoc cut-off back to ' + HUBDOC_START_DATE +
+             ' (was temporarily ' + o + ').');
 }
 
 function alreadySentToHubdoc(key) {
