@@ -71,19 +71,40 @@ var DOC_KEYWORDS = [
   'remittance', '"your account"'
 ];
 
-/** Never worth reading. */
+/**
+ * Never worth reading. Matched against the SUBJECT ONLY - see
+ * negativeSubjectFilter(). Gmail indexes the text inside attachments, so an
+ * unscoped term here silently excludes the whole email when any attached PDF
+ * happens to contain the word. That is a real bug this cost us: Hafele
+ * attaches "Terms and Conditions of Sale.PDF" to every tax invoice, those
+ * terms contain the word "quotation", and so every Hafele invoice was
+ * excluded from both queries for months while their statements (no T&C
+ * attached) filed normally.
+ */
 var NEGATIVE_KEYWORDS = [
   '"order confirmation"', '"order acknowledgement"', '"delivery docket"',
-  '"proof of delivery"', '"picking slip"', '"packing slip"', '"dispatch advice"',
-  '"shipping confirmation"', '"your order has"', '"quotation"', '"quote no"',
-  '"advanced shipping notice"', '"service calendar"'
+  '"delivery note"', '"proof of delivery"', '"picking slip"', '"packing slip"',
+  '"dispatch advice"', '"shipping confirmation"', '"your order has"',
+  '"quotation"', '"quote no"', '"advanced shipping notice"',
+  '"service calendar"'
 ];
+
+/**
+ * Subject-scoped negative filter. Keeps attachment text out of the decision.
+ */
+function negativeSubjectFilter() {
+  return ' -{' + NEGATIVE_KEYWORDS.map(function (k) {
+    return 'subject:' + k;
+  }).join(' ') + '}';
+}
 
 /** Filenames that are never a statement. */
 var NEGATIVE_FILENAMES = [
   'delivery', 'docket', 'picking', 'packing', 'dispatch',
   'orderconf', 'order_conf', 'order confirmation', 'quote', 'quotation',
-  'calendar', 'pricebook', 'price book'
+  'calendar', 'pricebook', 'price book',
+  // Boilerplate suppliers staple to real invoices - free skip, never read.
+  'terms and conditions', 'terms of sale', 'termsofsale'
 ];
 
 /** Shared consumer providers - identify these suppliers by full address. */
@@ -202,6 +223,68 @@ function backfill(fromYyyyMmDd, toYyyyMmDd) {
  * Catch-up runs. Run clearProcessedLabels FIRST if the months you want were
  * already marked done by an earlier run, otherwise they stay excluded.
  */
+/**
+ * Re-examines everything the subject-scoping fix unblocked (Hafele invoices
+ * and anything else excluded because an attached PDF contained a negative
+ * keyword). Starts at the Hubdoc go-live date - invoices received before
+ * that are never forwarded anyway, by design.
+ *
+ * RUN protectManuallyForwarded() FIRST, or invoices you already forwarded
+ * by hand will be forwarded a second time and show up twice in Xero.
+ */
+function repushMissedInvoices() {
+  if (!PropertiesService.getScriptProperties().getProperty('HUBDOC_PROTECTED')) {
+    Logger.log('STOP: run protectManuallyForwarded() first, then run this again.');
+    return;
+  }
+  processRange('2026/08/11', tomorrow());
+}
+
+/**
+ * Finds every invoice you forwarded to Hubdoc BY HAND and records it in the
+ * sent ledger, so a catch-up run never forwards the same document twice.
+ * Safe to run more than once.
+ */
+function protectManuallyForwarded() {
+  var to = prop('HUBDOC_EMAIL');
+  var sealed = 0, forwards = 0;
+
+  MAILBOXES.forEach(function (user) {
+    var ids = gmailSearch(user, 'in:sent to:' + to + ' after:2026/07/01');
+    forwards += ids.length;
+    Logger.log(user + ': ' + ids.length + ' manual forward(s) to Hubdoc');
+
+    ids.forEach(function (id) {
+      try {
+        var sent = gmailApi(user, 'GET', 'messages/' + id + '?format=minimal');
+        var thread = gmailApi(user, 'GET', 'threads/' + sent.threadId + '?format=full');
+        (thread.messages || []).forEach(function (m) {
+          var h = headerMap(m);
+          // Only the supplier's original message carries the real ledger key.
+          if (isOurOwnMail(h.from || '')) return;
+          findPdfParts(m.payload).forEach(function (part) {
+            var key = m.id + '|' + (part.filename || 'unnamed.pdf');
+            if (!alreadySentToHubdoc(key)) {
+              markSentToHubdoc(key);
+              sealed++;
+              Logger.log('  protected: ' + (h.subject || '') + '  [' +
+                         (part.filename || '') + ']');
+            }
+          });
+        });
+      } catch (e) {
+        Logger.log('  could not read forward ' + id + ': ' + e);
+      }
+    });
+  });
+
+  PropertiesService.getScriptProperties()
+    .setProperty('HUBDOC_PROTECTED', String(Date.now()));
+  Logger.log(forwards + ' manual forward(s) examined, ' + sealed +
+             ' document(s) marked as already sent.');
+  Logger.log('Now run repushMissedInvoices().');
+}
+
 function fixJuneOnwards() {
   processRange('2026/06/01', '2026/08/13');
 }
@@ -578,18 +661,18 @@ function processMailbox(user, after, before, opts, budget, stats, discovered,
   if (XLSX_INVOICE_SUPPLIERS.length) {
     queries.push(base0 + ' filename:(xlsx OR xls)' +
                  ' from:(' + XLSX_INVOICE_SUPPLIERS.join(' OR ') + ')' +
-                 ' -{' + NEGATIVE_KEYWORDS.join(' ') + '}' +
+                 negativeSubjectFilter() +
                  dateRange + notProcessed);
   }
   if (suppliers.length) {
     queries.push(base + ' from:(' + suppliers.join(' OR ') + ')' +
-                 ' -{' + NEGATIVE_KEYWORDS.join(' ') + '}' +
+                 negativeSubjectFilter() +
                  dateRange + notProcessed);
   }
   var exclude = suppliers.concat(IGNORE_SENDERS)
                   .map(function (d) { return '-from:' + d; }).join(' ');
   queries.push(base + ' {' + DOC_KEYWORDS.join(' ') + '}' +
-               ' -{' + NEGATIVE_KEYWORDS.join(' ') + '} ' + exclude +
+               negativeSubjectFilter() + ' ' + exclude +
                dateRange + notProcessed);
 
   queries.forEach(function (query) {
@@ -1930,6 +2013,16 @@ function undoTonight() {
 /** One-off: Cordell is a CUSTOMER, not a supplier - it was learned by mistake. */
 function fixCordell() {
   forgetSupplier('cordellconstructions.com.au');
+}
+
+/**
+ * One-off: Hafele was filing as "Hafele Australia Pty. Ltd." - the trailing
+ * full stop produced "...Ltd..pdf". Future statements file as "Hafele".
+ * Existing Dropbox files keep their old names; rename them by hand if you
+ * care, or leave them.
+ */
+function fixHafeleName() {
+  setCanonicalName('hafele.com.au', 'Hafele');
 }
 
 // ---------------------------------------------------------------- learning
